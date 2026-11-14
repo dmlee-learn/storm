@@ -2,7 +2,7 @@ import dspy
 from itertools import zip_longest
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from typing import List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from .callback import BaseCallbackHandler
 from .collaborative_storm_utils import (
@@ -186,10 +186,30 @@ class Moderator(Agent):
         )
         self.callback_handler = callback_handler
         self.encoder = encoder
+        # Cache snippet text -> embedding so that cited snippets are not
+        # re-embedded on every moderator turn.
+        self._snippet_embedding_cache: Dict[str, np.ndarray] = {}
 
     def _get_conv_turn_unused_information(
-        self, conv_turn: ConversationTurn, knowledge_base: KnowledgeBase
+        self,
+        conv_turn: ConversationTurn,
+        knowledge_base: KnowledgeBase,
+        snippet_embedding_cache: Optional[Dict[str, np.ndarray]] = None,
     ):
+        if snippet_embedding_cache is None:
+            snippet_embedding_cache = self._snippet_embedding_cache
+
+        def encode_with_cache(texts):
+            """Embed only texts that are missing from the cache."""
+            if isinstance(texts, str):
+                texts = [texts]
+            missing = [text for text in texts if text not in snippet_embedding_cache]
+            if missing:
+                missing_embeddings = self.encoder.encode(missing, max_workers=20)
+                for text, embedding in zip(missing, missing_embeddings):
+                    snippet_embedding_cache[text] = embedding
+            return np.array([snippet_embedding_cache[text] for text in texts])
+
         # extract all snippets from raw retrieved information
         raw_retrieved_info: List[Information] = conv_turn.raw_retrieved_info
         raw_retrieved_single_snippet_info: List[Information] = []
@@ -200,7 +220,9 @@ class Moderator(Agent):
                 )
         # get all cited information
         cited_info = list(knowledge_base.info_uuid_to_info_dict.values())
-        cited_info_hash_set = set([hash(info) for info in cited_info])
+        # info_hash_to_uuid_dict keys are exactly hash(Information) values of the
+        # cited information, so they can be reused without re-hashing each object.
+        cited_info_hash_set = set(knowledge_base.info_hash_to_uuid_dict.keys())
         cited_snippets = [info.snippets[0] for info in cited_info]
         # get list of unused information
         unused_information: List[Information] = [
@@ -213,22 +235,23 @@ class Moderator(Agent):
         # extract snippets to get embeddings
         unused_information_snippets = [info.snippets[0] for info in unused_information]
         # get embeddings
-        unused_snippets_embeddings = self.encoder.encode(
-            unused_information_snippets, max_workers=20
-        )
-        claim_embedding = self.encoder.encode(conv_turn.claim_to_make)
-        query_embedding = self.encoder.encode(conv_turn.queries)
-        cited_snippets_embedding = self.encoder.encode(cited_snippets)
+        unused_snippets_embeddings = encode_with_cache(unused_information_snippets)
+        claim_embedding = encode_with_cache(conv_turn.claim_to_make)
+        query_embedding = encode_with_cache(conv_turn.queries)
+        if cited_snippets:
+            cited_snippets_embedding = encode_with_cache(cited_snippets)
+            cited_snippets_similarity = np.max(
+                cosine_similarity(unused_snippets_embeddings, cited_snippets_embedding),
+                axis=1,
+            )
+            cited_snippets_similarity = np.clip(cited_snippets_similarity, 0, 1)
+        else:
+            cited_snippets_similarity = np.zeros(len(unused_information))
         # calculate similarity
         query_similarities = cosine_similarity(
             unused_snippets_embeddings, query_embedding
         )
         max_query_similarity = np.max(query_similarities, axis=1)
-        cited_snippets_similarity = np.max(
-            cosine_similarity(unused_snippets_embeddings, cited_snippets_embedding),
-            axis=1,
-        )
-        cited_snippets_similarity = np.clip(cited_snippets_similarity, 0, 1)
         # use claim similarity to filter out "real" not useful data
         claim_similarity = cosine_similarity(
             unused_snippets_embeddings, claim_embedding.reshape(1, -1)
@@ -260,12 +283,15 @@ class Moderator(Agent):
             if conv_turn.utterance_type == "Questioning":
                 break
             considered_conv_turn.append(conv_turn)
-            batch_snippets.extend(
-                sum([info.snippets for info in conv_turn.raw_retrieved_info], [])
-            )
+            for info in conv_turn.raw_retrieved_info:
+                batch_snippets.extend(info.snippets)
             batch_snippets.append(conv_turn.claim_to_make)
             batch_snippets.extend(conv_turn.queries)
-        self.encoder.encode(batch_snippets, max_workers=20)
+        # Warm the shared cache with one batch call. The same cache is reused by
+        # _get_conv_turn_unused_information below and on later turns.
+        batch_embeddings = self.encoder.encode(batch_snippets, max_workers=20)
+        for text, embedding in zip(batch_snippets, batch_embeddings):
+            self._snippet_embedding_cache[text] = embedding
 
         # get sorted unused snippets for each turn
         sorted_snippets = []

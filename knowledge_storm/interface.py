@@ -67,14 +67,6 @@ class Information:
         self.meta = meta if meta is not None else {}
         self.citation_uuid = -1
 
-    def __hash__(self):
-        return hash(
-            (
-                self.url,
-                tuple(sorted(self.snippets)),
-            )
-        )
-
     def __eq__(self, other):
         if not isinstance(other, Information):
             return False
@@ -85,8 +77,11 @@ class Information:
         )
 
     def __hash__(self):
+        # Must be consistent with __eq__, which compares snippets as sets.
         return int(
-            self._md5_hash((self.url, tuple(sorted(self.snippets)), self._meta_str())),
+            self._md5_hash(
+                (self.url, tuple(sorted(set(self.snippets))), self._meta_str())
+            ),
             16,
         )
 

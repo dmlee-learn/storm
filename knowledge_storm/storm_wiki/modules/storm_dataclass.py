@@ -1,14 +1,27 @@
 import copy
 import re
+import threading
 from collections import OrderedDict
 from typing import Union, Optional, Any, List, Tuple, Dict
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
 from ...interface import Information, InformationTable, Article, ArticleSectionNode
 from ...utils import ArticleTextProcessing, FileIOHelper
+
+_SENTENCE_TRANSFORMER = None
+_SENTENCE_TRANSFORMER_LOCK = threading.Lock()
+
+
+def _get_sentence_transformer() -> SentenceTransformer:
+    """Load the sentence transformer once per process."""
+    global _SENTENCE_TRANSFORMER
+    if _SENTENCE_TRANSFORMER is None:
+        with _SENTENCE_TRANSFORMER_LOCK:
+            if _SENTENCE_TRANSFORMER is None:
+                _SENTENCE_TRANSFORMER = SentenceTransformer("paraphrase-MiniLM-L6-v2")
+    return _SENTENCE_TRANSFORMER
 
 
 class DialogueTurn:
@@ -107,27 +120,52 @@ class StormInformationTable(InformationTable):
         return cls(conversations)
 
     def prepare_table_for_retrieval(self):
-        self.encoder = SentenceTransformer("paraphrase-MiniLM-L6-v2")
+        self.encoder = _get_sentence_transformer()
         self.collected_urls = []
         self.collected_snippets = []
         for url, information in self.url_to_info.items():
             for snippet in information.snippets:
                 self.collected_urls.append(url)
                 self.collected_snippets.append(snippet)
-        self.encoded_snippets = self.encoder.encode(self.collected_snippets)
+
+        if not self.collected_snippets:
+            self.encoded_snippets = np.zeros((0, 0))
+            return
+
+        # Encode each distinct snippet once, then restore the original order.
+        unique_snippets = list(dict.fromkeys(self.collected_snippets))
+        encoded_unique = self.encoder.encode(
+            unique_snippets,
+            batch_size=64,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        snippet_to_embedding = dict(zip(unique_snippets, encoded_unique))
+        self.encoded_snippets = np.array(
+            [snippet_to_embedding[snippet] for snippet in self.collected_snippets]
+        )
 
     def retrieve_information(
-        self, queries: Union[List[str], str], search_top_k
+        self, queries: Union[List[str], str], search_top_k: int
     ) -> List[Information]:
         selected_urls = []
         selected_snippets = []
         if type(queries) is str:
             queries = [queries]
+        if len(self.collected_snippets) == 0 or search_top_k <= 0:
+            return []
+
+        search_top_k = min(search_top_k, len(self.collected_snippets))
         for query in queries:
-            encoded_query = self.encoder.encode(query)
-            sim = cosine_similarity([encoded_query], self.encoded_snippets)[0]
-            sorted_indices = np.argsort(sim)
-            for i in sorted_indices[-search_top_k:][::-1]:
+            encoded_query = self.encoder.encode(
+                query, normalize_embeddings=True, show_progress_bar=False
+            )
+            # Both matrices are L2-normalized, so a dot product is the cosine similarity.
+            sim = self.encoded_snippets @ encoded_query
+            # Only the top-k scores need to be fully sorted.
+            top_indices = np.argpartition(-sim, search_top_k - 1)[:search_top_k]
+            top_indices = top_indices[np.argsort(-sim[top_indices])]
+            for i in top_indices:
                 selected_urls.append(self.collected_urls[i])
                 selected_snippets.append(self.collected_snippets[i])
 
@@ -139,7 +177,9 @@ class StormInformationTable(InformationTable):
 
         selected_url_to_info = {}
         for url in url_to_snippets:
-            selected_url_to_info[url] = copy.deepcopy(self.url_to_info[url])
+            # Only `snippets` is replaced, so a shallow copy is sufficient and
+            # avoids deep-copying meta data for every retrieved URL.
+            selected_url_to_info[url] = copy.copy(self.url_to_info[url])
             selected_url_to_info[url].snippets = list(url_to_snippets[url])
 
         return list(selected_url_to_info.values())
@@ -211,12 +251,14 @@ class StormArticle(Article):
         article_dict: Dict[str, Dict],
         parent_section_name: str = None,
         trim_children=False,
+        parent_section: Optional[ArticleSectionNode] = None,
     ):
-        parent_node = (
-            self.root
-            if parent_section_name is None
-            else self.find_section(self.root, parent_section_name)
-        )
+        if parent_section is not None:
+            parent_node = parent_section
+        elif parent_section_name is None:
+            parent_node = self.root
+        else:
+            parent_node = self.find_section(self.root, parent_section_name)
 
         if trim_children:
             section_names = set(article_dict.keys())
@@ -242,8 +284,8 @@ class StormArticle(Article):
 
             self.insert_or_create_section(
                 article_dict=content_dict["subsections"],
-                parent_section_name=section_name,
                 trim_children=True,
+                parent_section=current_section_node,
             )
 
     def update_section(

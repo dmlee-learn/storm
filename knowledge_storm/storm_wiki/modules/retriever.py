@@ -222,12 +222,17 @@ BLACKLISTED = {
 }
 
 
+_COMBINED_UNRELIABLE_SOURCES = frozenset(
+    domain.lower() for domain in GENERALLY_UNRELIABLE | DEPRECATED | BLACKLISTED
+)
+
+
 def is_valid_wikipedia_source(url):
     parsed_url = urlparse(url)
-    # Check if the URL is from a reliable domain
-    combined_set = GENERALLY_UNRELIABLE | DEPRECATED | BLACKLISTED
-    for domain in combined_set:
-        if domain in parsed_url.netloc:
+    # Hostnames are case-insensitive, so compare in lowercase.
+    netloc = parsed_url.netloc.lower()
+    for domain in _COMBINED_UNRELIABLE_SOURCES:
+        if domain in netloc:
             return False
 
     return True

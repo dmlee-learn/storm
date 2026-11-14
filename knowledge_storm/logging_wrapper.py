@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import threading
 import time
 import pytz
 from datetime import datetime
@@ -57,70 +58,83 @@ class LoggingWrapper:
         self.logging_dict = {}
         self.lm_config = lm_config
         self.current_pipeline_stage = None
-        self.event_stack = []
+        # Events are nested per thread. Co-STORM runs experts and sections in
+        # parallel, so a single shared stack mixes their start/end pairs.
+        self._thread_local = threading.local()
+        self._lock = threading.Lock()
         self.pipeline_stage_active = False
 
-    def _pipeline_stage_start(self, pipeline_stage: str):
-        if self.pipeline_stage_active:
-            raise RuntimeError(
-                "A pipeline stage is already active. End the current stage before starting a new one."
-            )
+    @property
+    def event_stack(self):
+        stack = getattr(self._thread_local, "event_stack", None)
+        if stack is None:
+            stack = []
+            self._thread_local.event_stack = stack
+        return stack
 
-        self.current_pipeline_stage = pipeline_stage
-        self.logging_dict[pipeline_stage] = {
-            "time_usage": {},
-            "lm_usage": {},
-            "lm_history": [],
-            "query_count": 0,
-        }
-        self.pipeline_stage_active = True
+    def _pipeline_stage_start(self, pipeline_stage: str):
+        with self._lock:
+            if self.pipeline_stage_active:
+                raise RuntimeError(
+                    "A pipeline stage is already active. End the current stage before starting a new one."
+                )
+
+            self.current_pipeline_stage = pipeline_stage
+            self.logging_dict[pipeline_stage] = {
+                "time_usage": {},
+                "lm_usage": {},
+                "lm_history": [],
+                "query_count": 0,
+            }
+            self.pipeline_stage_active = True
 
     def _event_start(self, event_name: str):
-        if not self.pipeline_stage_active:
-            raise RuntimeError("No pipeline stage is currently active.")
+        with self._lock:
+            if not self.pipeline_stage_active:
+                raise RuntimeError("No pipeline stage is currently active.")
 
-        if not self.event_stack and self.current_pipeline_stage:
-            # Top-level event (directly under the pipeline stage)
-            if (
-                event_name
-                not in self.logging_dict[self.current_pipeline_stage]["time_usage"]
-            ):
-                event = EventLog(event_name=event_name)
-                event.record_start_time()
-                self.logging_dict[self.current_pipeline_stage]["time_usage"][
+            if not self.event_stack and self.current_pipeline_stage:
+                # Top-level event (directly under the pipeline stage)
+                if (
                     event_name
-                ] = event
-                self.event_stack.append(event)
+                    not in self.logging_dict[self.current_pipeline_stage]["time_usage"]
+                ):
+                    event = EventLog(event_name=event_name)
+                    event.record_start_time()
+                    self.logging_dict[self.current_pipeline_stage]["time_usage"][
+                        event_name
+                    ] = event
+                    self.event_stack.append(event)
+                else:
+                    self.logging_dict[self.current_pipeline_stage]["time_usage"][
+                        event_name
+                    ].record_start_time()
+            elif self.event_stack:
+                # Nested event (under another event)
+                parent_event = self.event_stack[-1]
+                if event_name not in parent_event.get_child_events():
+                    event = EventLog(event_name=event_name)
+                    event.record_start_time()
+                    parent_event.add_child_event(event)
+                    self.logging_dict[self.current_pipeline_stage]["time_usage"][
+                        event_name
+                    ] = event
+                    self.event_stack.append(event)
+                else:
+                    parent_event.get_child_events()[event_name].record_start_time()
             else:
-                self.logging_dict[self.current_pipeline_stage]["time_usage"][
-                    event_name
-                ].record_start_time()
-        elif self.event_stack:
-            # Nested event (under another event)
-            parent_event = self.event_stack[-1]
-            if event_name not in parent_event.get_child_events():
-                event = EventLog(event_name=event_name)
-                event.record_start_time()
-                parent_event.add_child_event(event)
-                self.logging_dict[self.current_pipeline_stage]["time_usage"][
-                    event_name
-                ] = event
-                self.event_stack.append(event)
-            else:
-                parent_event.get_child_events()[event_name].record_start_time()
-        else:
-            raise RuntimeError(
-                "Cannot start an event without an active pipeline stage or parent event."
-            )
+                raise RuntimeError(
+                    "Cannot start an event without an active pipeline stage or parent event."
+                )
 
     def _event_end(self, event_name: str):
-        if not self.pipeline_stage_active:
-            raise RuntimeError("No pipeline stage is currently active.")
+        with self._lock:
+            if not self.pipeline_stage_active:
+                raise RuntimeError("No pipeline stage is currently active.")
 
-        if not self.event_stack:
-            raise RuntimeError("No parent event is currently active.")
+            if not self.event_stack:
+                raise RuntimeError("No parent event is currently active.")
 
-        if self.event_stack:
             current_event_log = self.event_stack[-1]
             if event_name in current_event_log.get_child_events():
                 current_event_log.get_child_events()[event_name].record_end_time()
@@ -137,28 +151,28 @@ class LoggingWrapper:
                 )
             if current_event_log.event_name == event_name:
                 self.event_stack.pop()
-        else:
-            raise RuntimeError("Cannot end an event without an active parent event.")
 
     def _pipeline_stage_end(self):
-        if not self.pipeline_stage_active:
-            raise RuntimeError("No pipeline stage is currently active to end.")
+        with self._lock:
+            if not self.pipeline_stage_active:
+                raise RuntimeError("No pipeline stage is currently active to end.")
 
-        self.logging_dict[self.current_pipeline_stage][
-            "lm_usage"
-        ] = self.lm_config.collect_and_reset_lm_usage()
-        self.logging_dict[self.current_pipeline_stage][
-            "lm_history"
-        ] = self.lm_config.collect_and_reset_lm_history()
-        self.pipeline_stage_active = False
+            self.logging_dict[self.current_pipeline_stage][
+                "lm_usage"
+            ] = self.lm_config.collect_and_reset_lm_usage()
+            self.logging_dict[self.current_pipeline_stage][
+                "lm_history"
+            ] = self.lm_config.collect_and_reset_lm_history()
+            self.pipeline_stage_active = False
 
     def add_query_count(self, count):
-        if not self.pipeline_stage_active:
-            raise RuntimeError(
-                "No pipeline stage is currently active to add query count."
-            )
+        with self._lock:
+            if not self.pipeline_stage_active:
+                raise RuntimeError(
+                    "No pipeline stage is currently active to add query count."
+                )
 
-        self.logging_dict[self.current_pipeline_stage]["query_count"] += count
+            self.logging_dict[self.current_pipeline_stage]["query_count"] += count
 
     @contextmanager
     def log_event(self, event_name):
@@ -166,8 +180,11 @@ class LoggingWrapper:
             raise RuntimeError("No pipeline stage is currently active.")
 
         self._event_start(event_name)
-        yield
-        self._event_end(event_name)
+        try:
+            yield
+        finally:
+            # Always pop the event, even when the wrapped block raises.
+            self._event_end(event_name)
 
     @contextmanager
     def log_pipeline_stage(self, pipeline_stage):
@@ -183,6 +200,7 @@ class LoggingWrapper:
             yield
         except Exception as e:
             print(f"Error occurred during pipeline stage '{pipeline_stage}': {e}")
+            raise
         finally:
             self.logging_dict[self.current_pipeline_stage]["total_wall_time"] = (
                 time.time() - start_time

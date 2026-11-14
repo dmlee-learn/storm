@@ -294,14 +294,10 @@ class InsertInformationModule(dspy.Module):
                 to_return.append((info, placement_prediction))
             return to_return
         else:
-            # use sequential insert as knowledge base structure might change
+            # Placements are computed before any information is inserted, so the
+            # knowledge base structure is stable for the whole loop. Recomputing
+            # the outline embedding per intent is redundant.
             for question, query in intent_to_placement_dict:
-                (
-                    encoded_outlines,
-                    outlines,
-                ) = knowledge_base.get_knowledge_base_structure_embedding(
-                    root=insert_root
-                )
                 _, placement_prediction = process_intent(question=question, query=query)
                 intent_to_placement_dict[(question, query)] = placement_prediction
 

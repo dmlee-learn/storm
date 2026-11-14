@@ -99,6 +99,8 @@ Currently, our package support:
 
 :star2: **PRs for integrating more search engines/retrievers into [knowledge_storm/rm.py](knowledge_storm/rm.py) are highly appreciated!**
 
+`DuckDuckGoSearchRM` uses the [`ddgs`](https://github.com/deedy5/ddgs) package by default. Install it with `pip install ddgs`; the legacy `duckduckgo_search` package is still supported as a fallback.
+
 Both STORM and Co-STORM are working in the information curation layer, you need to set up the information retrieval module and language model module to create their `Runner` classes respectively.
 
 ### STORM

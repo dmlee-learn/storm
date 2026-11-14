@@ -1,6 +1,6 @@
 import dspy
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Set, Union
+from typing import Optional, Set, Union
 
 from .collaborative_storm_utils import clean_up_section
 from ...dataclass import KnowledgeBase, KnowledgeNode
@@ -37,7 +37,11 @@ class ArticleGenerationModule(dspy.Module):
         return "\n".join(information)
 
     def gen_section(
-        self, topic: str, node: KnowledgeNode, knowledge_base: KnowledgeBase
+        self,
+        topic: str,
+        node: KnowledgeNode,
+        knowledge_base: KnowledgeBase,
+        all_citation_index: Optional[Set[int]] = None,
     ):
         if node is None or len(node.content) == 0:
             return ""
@@ -47,7 +51,8 @@ class ArticleGenerationModule(dspy.Module):
             and not node.need_regenerate_synthesize_output
         ):
             return node.synthesize_output
-        all_citation_index = node.collect_all_content()
+        if all_citation_index is None:
+            all_citation_index = node.collect_all_content()
         information = self._get_cited_information_string(
             all_citation_index=all_citation_index, knowledge_base=knowledge_base
         )
@@ -65,10 +70,27 @@ class ArticleGenerationModule(dspy.Module):
         all_nodes = knowledge_base.collect_all_nodes()
         node_to_paragraph = {}
 
+        # Compute the union of cited content for every node once. Calling
+        # node.collect_all_content() inside _node_generate_paragraph would walk
+        # each subtree again and degrade to O(N^2) on large knowledge bases.
+        content_by_node = {}
+
+        def _collect_content(node):
+            content = set(node.content)
+            for child in node.children:
+                content.update(_collect_content(child))
+            content_by_node[id(node)] = content
+            return content
+
+        _collect_content(knowledge_base.root)
+
         # Define a function to generate paragraphs for nodes
         def _node_generate_paragraph(node):
             node_gen_paragraph = self.gen_section(
-                topic=knowledge_base.topic, node=node, knowledge_base=knowledge_base
+                topic=knowledge_base.topic,
+                node=node,
+                knowledge_base=knowledge_base,
+                all_citation_index=content_by_node[id(node)],
             )
             lines = node_gen_paragraph.split("\n")
             if lines[0].strip().replace("*", "").replace("#", "") == node.name:

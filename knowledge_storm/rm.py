@@ -9,6 +9,10 @@ from dsp import backoff_hdlr, giveup_hdlr
 
 from .utils import WebPageHelper
 
+# All external HTTP calls should be bounded. Without a timeout a single
+# unresponsive endpoint stalls the whole pipeline.
+DEFAULT_HTTP_TIMEOUT = 10
+
 
 class YouRM(dspy.Retrieve):
     def __init__(self, ydc_api_key=None, k=3, is_valid_source: Callable = None):
@@ -60,6 +64,7 @@ class YouRM(dspy.Retrieve):
                 results = requests.get(
                     f"https://api.ydc-index.io/search?query={query}",
                     headers=headers,
+                    timeout=DEFAULT_HTTP_TIMEOUT,
                 ).json()
 
                 authoritative_results = []
@@ -151,7 +156,10 @@ class BingSearch(dspy.Retrieve):
         for query in queries:
             try:
                 results = requests.get(
-                    self.endpoint, headers=headers, params={**self.params, "q": query}
+                    self.endpoint,
+                    headers=headers,
+                    params={**self.params, "q": query},
+                    timeout=DEFAULT_HTTP_TIMEOUT,
                 ).json()
 
                 for d in results["webPages"]["value"]:
@@ -356,7 +364,10 @@ class StanfordOvalArxivRM(dspy.Retrieve):
         payload = {"query": query, "num_blocks": self.k, "rerank": self.rerank}
 
         response = requests.post(
-            self.endpoint, json=payload, headers={"Content-Type": "application/json"}
+            self.endpoint,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
 
         # Check if the request was successful
@@ -447,7 +458,9 @@ class SerperRM(dspy.Retrieve):
         if query_params is None:
             self.query_params = {"num": k, "autocorrect": True, "page": 1}
         else:
-            self.query_params = query_params
+            # Copy so that mutating this instance's params never touches the
+            # caller's dictionary.
+            self.query_params = dict(query_params)
             self.query_params.update({"num": k})
         self.serper_search_api_key = serper_search_api_key
         if not self.serper_search_api_key and not os.environ.get("SERPER_API_KEY"):
@@ -464,7 +477,7 @@ class SerperRM(dspy.Retrieve):
         self.base_url = "https://google.serper.dev"
 
     def serper_runner(self, query_params):
-        self.search_url = f"{self.base_url}/search"
+        search_url = f"{self.base_url}/search"
 
         headers = {
             "X-API-KEY": self.serper_search_api_key,
@@ -472,7 +485,11 @@ class SerperRM(dspy.Retrieve):
         }
 
         response = requests.request(
-            "POST", self.search_url, headers=headers, json=query_params
+            "POST",
+            search_url,
+            headers=headers,
+            json=query_params,
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
 
         if response == None:
@@ -506,12 +523,13 @@ class SerperRM(dspy.Retrieve):
         )
 
         self.usage += len(queries)
-        self.results = []
-        collected_results = []
+        raw_results = []
         for query in queries:
             if query == "Queries:":
                 continue
-            query_params = self.query_params
+            # Keep request state local: forward() can be called concurrently for
+            # different queries on the same retriever instance.
+            query_params = dict(self.query_params)
 
             # All available parameters can be found in the playground: https://serper.dev/playground
             # Sets the json value for query to be the query that is being parsed.
@@ -520,15 +538,14 @@ class SerperRM(dspy.Retrieve):
             # Sets the type to be search, can be images, video, places, maps etc that Google provides.
             query_params["type"] = "search"
 
-            self.result = self.serper_runner(query_params)
-            self.results.append(self.result)
+            raw_results.append(self.serper_runner(query_params))
 
         # Array of dictionaries that will be used by Storm to create the jsons
         collected_results = []
 
         if self.ENABLE_EXTRA_SNIPPET_EXTRACTION:
             urls = []
-            for result in self.results:
+            for result in raw_results:
                 organic_results = result.get("organic", [])
                 for organic in organic_results:
                     url = organic.get("link")
@@ -538,7 +555,7 @@ class SerperRM(dspy.Retrieve):
         else:
             valid_url_to_snippets = {}
 
-        for result in self.results:
+        for result in raw_results:
             try:
                 # An array of dictionaries that contains the snippets, title of the document and url that will be used.
                 organic_results = result.get("organic")
@@ -623,6 +640,7 @@ class BraveRM(dspy.Retrieve):
                 response = requests.get(
                     f"https://api.search.brave.com/res/v1/web/search?result_filter=web&q={query}",
                     headers=headers,
+                    timeout=DEFAULT_HTTP_TIMEOUT,
                 ).json()
                 results = response.get("web", {}).get("results", [])
 
@@ -705,7 +723,10 @@ class SearXNG(dspy.Retrieve):
             try:
                 params = {"q": query, "format": "json"}
                 response = requests.get(
-                    self.searxng_api_url, headers=headers, params=params
+                    self.searxng_api_url,
+                    headers=headers,
+                    params=params,
+                    timeout=DEFAULT_HTTP_TIMEOUT,
                 )
                 results = response.json()
 
@@ -726,7 +747,11 @@ class SearXNG(dspy.Retrieve):
 
 
 class DuckDuckGoSearchRM(dspy.Retrieve):
-    """Retrieve information from custom queries using DuckDuckGo."""
+    """Retrieve information from custom queries using DuckDuckGo.
+
+    Uses the `ddgs` package (the successor of `duckduckgo_search`) when it is
+    installed, and falls back to the legacy `duckduckgo_search` package.
+    """
 
     def __init__(
         self,
@@ -737,21 +762,52 @@ class DuckDuckGoSearchRM(dspy.Retrieve):
         webpage_helper_max_threads=10,
         safe_search: str = "On",
         region: str = "us-en",
+        backend: str = None,
     ):
         """
         Params:
             min_char_count: Minimum character count for the article to be considered valid.
             snippet_chunk_size: Maximum character count for each snippet.
             webpage_helper_max_threads: Maximum number of threads to use for webpage helper.
-            **kwargs: Additional parameters for the OpenAI API.
+            safe_search: Safe search setting, one of "On", "Moderate", or "Off".
+            region: Specifies the region that the search will use, e.g. "us-en".
+            backend: Search backend(s) to use. Defaults to "auto", which lets the
+                search library pick the available backend(s). `ddgs` accepts a
+                single or comma-delimited list of: brave, duckduckgo, mojeek,
+                startpage, yahoo, wikipedia, etc.
         """
         super().__init__(k=k)
         try:
-            from duckduckgo_search import DDGS
-        except ImportError as err:
-            raise ImportError(
-                "Duckduckgo requires `pip install duckduckgo_search`."
-            ) from err
+            # `ddgs` is the successor of `duckduckgo_search`:
+            #   https://github.com/deedy5/ddgs
+            from ddgs import DDGS
+            from ddgs.exceptions import (
+                DDGSException,
+                RatelimitException,
+                TimeoutException,
+            )
+
+            search_exceptions = (DDGSException,)
+            retryable_exceptions = (RatelimitException, TimeoutException)
+            no_result_exceptions = (DDGSException,)
+        except ImportError:
+            try:
+                from duckduckgo_search import DDGS
+                from duckduckgo_search.exceptions import DuckDuckGoSearchException
+
+                search_exceptions = (DuckDuckGoSearchException,)
+                retryable_exceptions = ()
+                no_result_exceptions = ()
+            except ImportError as err:
+                raise ImportError(
+                    "DuckDuckGo search requires `pip install ddgs` (recommended) "
+                    "or `pip install duckduckgo_search`."
+                ) from err
+
+        self._search_exceptions = search_exceptions
+        self._retryable_exceptions = retryable_exceptions
+        self._no_result_exceptions = no_result_exceptions
+
         self.k = k
         self.webpage_helper = WebPageHelper(
             min_char_count=min_char_count,
@@ -762,11 +818,11 @@ class DuckDuckGoSearchRM(dspy.Retrieve):
         # All params for search can be found here:
         #   https://duckduckgo.com/duckduckgo-help-pages/settings/params/
 
-        # Sets the backend to be api
-        self.duck_duck_go_backend = "api"
+        # Sets the search backend to use
+        self.duck_duck_go_backend = backend or "auto"
 
         # Only gets safe search results
-        self.duck_duck_go_safe_search = safe_search
+        self.duck_duck_go_safe_search = safe_search.lower()
 
         # Specifies the region that the search will use
         self.duck_duck_go_region = region
@@ -777,7 +833,6 @@ class DuckDuckGoSearchRM(dspy.Retrieve):
         else:
             self.is_valid_source = lambda x: True
 
-        # Import the duckduckgo search library found here: https://github.com/deedy5/duckduckgo_search
         self.ddgs = DDGS()
 
     def get_usage_and_reset(self):
@@ -794,9 +849,25 @@ class DuckDuckGoSearchRM(dspy.Retrieve):
         giveup=giveup_hdlr,
     )
     def request(self, query: str):
-        results = self.ddgs.text(
-            query, max_results=self.k, backend=self.duck_duck_go_backend
-        )
+        try:
+            results = self.ddgs.text(
+                query,
+                region=self.duck_duck_go_region,
+                safesearch=self.duck_duck_go_safe_search,
+                max_results=self.k,
+                backend=self.duck_duck_go_backend,
+            )
+        except self._search_exceptions as err:
+            if isinstance(err, self._retryable_exceptions) or not isinstance(
+                err, self._no_result_exceptions
+            ):
+                raise
+            # `ddgs` raises an exception when a query returns no results.
+            # Treat it as an empty result set instead of retrying with backoff.
+            logging.warning(
+                "DuckDuckGo returned no results for query %r: %s", query, err
+            )
+            return []
         return results
 
     def forward(

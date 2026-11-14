@@ -2,7 +2,7 @@ import os
 import numpy as np
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple, Union, Optional, Dict, Literal
+from typing import List, Tuple, Union, Optional
 from pathlib import Path
 
 try:
@@ -109,70 +109,115 @@ class Encoder:
             self.total_token_usage = 0
         return token_usage
 
-    def encode(self, texts: Union[str, List[str]], max_workers: int = 5) -> np.ndarray:
+    def encode(
+        self,
+        texts: Union[str, List[str]],
+        max_workers: int = 5,
+        batch_size: int = 128,
+    ) -> np.ndarray:
         """
         Public method to get embeddings for the given texts.
 
         Args:
             texts (Union[str, List[str]]): A single text string or a list of text strings to embed.
+            max_workers (int): The maximum number of concurrent embedding requests.
+            batch_size (int): The maximum number of texts sent in a single request.
 
         Returns:
-            np.ndarray: The array of embeddings.
+            np.ndarray: A 1D array for a single input string, a 2D array for a list.
         """
-        return self._get_text_embeddings(texts, max_workers=max_workers)
-
-    def _get_single_text_embedding(self, text):
-        response = litellm.embedding(
-            model=self.embedding_model_name, input=text, caching=True, **self.kargs
+        return self._get_text_embeddings(
+            texts, max_workers=max_workers, batch_size=batch_size
         )
-        embedding = response.data[0]["embedding"]
-        token_usage = response.get("usage", {}).get("total_tokens", 0)
-        return text, embedding, token_usage
+
+    def _embed_batch(self, texts: List[str]) -> Tuple[List[List[float]], int]:
+        """Embed a batch of texts in a single API request."""
+
+        def get_field(item, name, default=None):
+            # litellm may return dicts or pydantic-like objects depending on
+            # the provider/version.
+            try:
+                return item[name]
+            except (KeyError, TypeError):
+                return getattr(item, name, default)
+
+        response = litellm.embedding(
+            model=self.embedding_model_name, input=texts, caching=True, **self.kargs
+        )
+        data = response.data
+        indices = [get_field(item, "index") for item in data]
+        if indices and all(index is not None for index in indices):
+            data = [
+                item for _, item in sorted(zip(indices, data), key=lambda pair: pair[0])
+            ]
+        embeddings = [get_field(item, "embedding") for item in data]
+        if any(embedding is None for embedding in embeddings):
+            raise RuntimeError(
+                "Embedding API response is missing an 'embedding' field."
+            )
+        if len(embeddings) != len(texts):
+            raise RuntimeError(
+                f"Embedding API returned {len(embeddings)} vectors for "
+                f"{len(texts)} inputs."
+            )
+        token_usage = (response.get("usage") or {}).get("total_tokens", 0)
+        return embeddings, token_usage
 
     def _get_text_embeddings(
         self,
         texts: Union[str, List[str]],
         max_workers: int = 5,
-    ) -> Tuple[np.ndarray, int]:
+        batch_size: int = 128,
+    ) -> np.ndarray:
         """
-        Get text embeddings using OpenAI's text-embedding-3-small model.
+        Get text embeddings in batches.
+
+        Identical texts are embedded only once, and results are restored to the
+        original input order. Failures are raised instead of being silently
+        dropped, so callers never receive a shorter array than they asked for.
 
         Args:
-            texts (Union[str, List[str]]): A single text string or a list of text strings to embed.
-            max_workers (int): The maximum number of workers for parallel processing.
-            api_key (str): The API key for accessing OpenAI's services.
-            embedding_cache (Optional[Dict[str, np.ndarray]]): A cache to store previously computed embeddings.
+            texts (Union[str, List[str]]): A single text string or a list of text strings.
+            max_workers (int): The maximum number of concurrent batch requests.
+            batch_size (int): The maximum number of texts per request.
 
         Returns:
-            Tuple[np.ndarray, int]: The 2D array of embeddings and the total token usage.
+            np.ndarray: A 1D array for a single input string, a 2D array for a list.
         """
+        is_single = isinstance(texts, str)
+        texts = [texts] if is_single else list(texts)
 
-        if isinstance(texts, str):
-            _, embedding, tokens = self._get_single_text_embedding(texts)
-            self.total_token_usage += tokens
-            return np.array(embedding)
+        if not texts:
+            return np.array([])
 
-        embeddings = []
+        unique_texts = list(dict.fromkeys(texts))
+        batches = [
+            unique_texts[start : start + batch_size]
+            for start in range(0, len(unique_texts), batch_size)
+        ]
+
+        embeddings_by_text = {}
         total_tokens = 0
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(max_workers, len(batches)))
+        ) as executor:
             futures = {
-                executor.submit(self._get_single_text_embedding, text): text
-                for text in texts
+                executor.submit(self._embed_batch, batch): batch for batch in batches
             }
 
             for future in as_completed(futures):
+                batch = futures[future]
                 try:
-                    text, embedding, tokens = future.result()
-                    embeddings.append((text, embedding, tokens))
-                    total_tokens += tokens
+                    batch_embeddings, batch_tokens = future.result()
                 except Exception as e:
-                    print(f"An error occurred for text: {futures[future]}")
-                    print(e)
+                    raise RuntimeError(
+                        f"Failed to embed a batch of {len(batch)} texts: {e}"
+                    ) from e
+                total_tokens += batch_tokens
+                for text, embedding in zip(batch, batch_embeddings):
+                    embeddings_by_text[text] = embedding
 
-        # Sort results to match the order of the input texts
-        embeddings.sort(key=lambda x: texts.index(x[0]))
-        embeddings = [result[1] for result in embeddings]
         self.total_token_usage += total_tokens
-
-        return np.array(embeddings)
+        ordered = np.array([embeddings_by_text[text] for text in texts])
+        return ordered[0] if is_single else ordered

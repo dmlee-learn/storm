@@ -539,15 +539,20 @@ class ArticleTextProcessing:
 
     @staticmethod
     def update_citation_index(s, citation_map):
-        """Update citation index in the string based on the citation map."""
-        for original_citation in citation_map:
-            s = s.replace(
-                f"[{original_citation}]", f"__PLACEHOLDER_{original_citation}__"
-            )
-        for original_citation, unify_citation in citation_map.items():
-            s = s.replace(f"__PLACEHOLDER_{original_citation}__", f"[{unify_citation}]")
+        """Update citation indexes in the string in a single regex pass."""
+        if not citation_map:
+            return s
 
-        return s
+        normalized_map = {str(key): value for key, value in citation_map.items()}
+        return re.sub(
+            r"\[(\d+)\]",
+            lambda match: (
+                f"[{normalized_map[match.group(1)]}]"
+                if match.group(1) in normalized_map
+                else match.group(0)
+            ),
+            s,
+        )
 
     @staticmethod
     def parse_article_into_dict(input_string):
@@ -681,25 +686,38 @@ class WebPageHelper:
             print(f"Error while requesting {exc.request.url!r} - {exc!r}")
             return None
 
-    def urls_to_articles(self, urls: List[str]) -> Dict:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.max_thread_num
-        ) as executor:
-            htmls = list(executor.map(self.download_webpage, urls))
-
-        articles = {}
-
-        for h, u in zip(htmls, urls):
-            if h is None:
-                continue
-            article_text = extract(
-                h,
+    @staticmethod
+    def _extract_article_text(html):
+        """Extract readable text from raw HTML, returning None on failure."""
+        if not html:
+            return None
+        try:
+            return extract(
+                html,
                 include_tables=False,
                 include_comments=False,
                 output_format="txt",
             )
+        except Exception as exc:
+            logging.warning(f"Failed to extract article text: {exc}")
+            return None
+
+    def urls_to_articles(self, urls: List[str]) -> Dict:
+        articles = {}
+        if not urls:
+            return articles
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_thread_num
+        ) as executor:
+            htmls = list(executor.map(self.download_webpage, urls))
+            # Extraction is CPU-heavy (trafilatura/lxml), so run it in parallel
+            # as well instead of serializing it in the calling thread.
+            article_texts = list(executor.map(self._extract_article_text, htmls))
+
+        for url, article_text in zip(urls, article_texts):
             if article_text is not None and len(article_text) > self.min_char_count:
-                articles[u] = {"text": article_text}
+                articles[url] = {"text": article_text}
 
         return articles
 
