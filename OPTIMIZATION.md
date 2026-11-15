@@ -35,7 +35,7 @@ print(engine.logging_wrapper.dump_logging_and_reset())
 | E7 | `knowledge_storm/interface.py:70-91` | `__hash__` 중복 정의, `__eq__`와 해시 계약 불일치 | dict/set 오동작 제거 | 완료 |
 | E8 | `knowledge_storm/rm.py` | SerperRM 공유 상태, 모든 HTTP 호출에 timeout 부재 | 병렬 결과 섞임/행(hang) 제거 | 완료 |
 | E9 | `knowledge_storm/logging_wrapper.py:55-190` | `event_stack` 스레드 비안전, 예외 시 이벤트 미종료, 파이프라인 예외 삼킴 | 병렬 로그 정확성 | 완료 |
-| E10 | `knowledge_storm/storm_wiki/modules/retriever.py:225-233` | 호출마다 ~200개 도메인 집합 재생성 | 호출당 상수 비용 제거 | 완료 |
+| E10 | `knowledge_storm/storm_wiki/modules/retriever.py:225-262` | 호출마다 ~200개 도메인 집합 재생성, 부분 문자열 매칭 오탐 | 호출당 상수 비용 제거, 오탐 제거 | 완료 |
 | E11 | `knowledge_storm/utils.py:540-550` | 인용 번호마다 `str.replace` 2회 | O(k·n) → O(n) | 완료 |
 | E12 | `knowledge_storm/collaborative_storm/modules/information_insertion_module.py:296-306` | 순차 삽입 루프에서 intent마다 KB 구조 재계산 | O(k·N) → O(N) | 완료 |
 
@@ -114,6 +114,12 @@ OpenAI 임베딩 API는 요청당 수천 개 입력을 받으므로 배치로 �
 
 - `GENERALLY_UNRELIABLE | DEPRECATED | BLACKLISTED`를 모듈 로드 시 한 번만 `frozenset`으로 만든다.
 - 도메인 비교를 소문자로 정규화한다. 기존 구현은 `"Amazon"` 같은 대문자 항목이 소문자 호스트와 매칭되지 않아 블랙리스트가 조용히 동작하지 않았다.
+- 매칭을 부분 문자열에서 **호스트 경계**로 바꾼다.
+  - 목록은 위키백과 문서 제목을 옮긴 것이라 206개 중 107개가 언더스코어를 포함한다(`Ad_Fontes_Media`). 호스트명에는 언더스코어가 없으므로 이런 항목은 매칭 대상에서 제외한다.
+  - 점이 있는 항목(`bestgore.com`)은 호스트 동일/서브도메인으로 비교한다.
+  - 점이 없는 항목(`amazon`, `medium`)은 호스트 라벨 정확 일치로 비교한다.
+  - `parsed_url.hostname`을 쓰므로 포트/사용자정보가 섞여도 호스트만 본다.
+- 이 변경으로 `notamazon.com`, `sports.yahoo.com`, `artsy.net`, `thehistoryblog.com` 같은 오탐이 사라졌다. 기존 구현은 `"RT"`가 소문자화되며 `sport`에 매칭되는 식이었다.
 
 ### E11. 인용 인덱스 갱신
 
@@ -207,8 +213,8 @@ python tests/ab_compare.py --old HEAD~5 --new HEAD --strict
 3. **E6 부모 이름 중복**: 기존에는 `B -> X`의 하위 섹션이 `A -> X` 밑으로 들어갔다.
    새 코드는 실제 부모 노드를 넘기므로 트리가 정확하다.
 4. **E10 도메인 블랙리스트**: 206개 항목 중 201개가 대문자를 포함해 기존 필터는 사실상
-   동작하지 않았다. 다만 `is_valid_wikipedia_source`는 현재 호출부가 없어 산출물에는
-   영향이 없다.
+   동작하지 않았다. 이제 소문자로 정규화하고 호스트 라벨 단위로 비교한다. 다만
+   `is_valid_wikipedia_source`는 현재 호출부가 없어 산출물에는 영향이 없다.
 
 ## 검증
 

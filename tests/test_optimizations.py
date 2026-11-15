@@ -165,38 +165,75 @@ def test_update_citation_index_single_pass():
     print("update_citation_index OK")
 
 
-def test_wikipedia_source_filter_is_case_insensitive():
+def _assigned_names(node):
+    names = set()
+    for target in getattr(node, "targets", []):
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names.update(item.id for item in target.elts if isinstance(item, ast.Name))
+    return names
+
+
+def load_wikipedia_source_filter():
     source = (
         ROOT / "knowledge_storm" / "storm_wiki" / "modules" / "retriever.py"
     ).read_text(encoding="utf-8")
     tree = ast.parse(source)
+    wanted_assignments = {
+        "GENERALLY_UNRELIABLE",
+        "DEPRECATED",
+        "BLACKLISTED",
+        "_COMBINED_UNRELIABLE_SOURCES",
+        "_BLOCKED_HOSTS",
+        "_BLOCKED_LABELS",
+    }
+    wanted_functions = {
+        "is_valid_wikipedia_source",
+        "_split_blocklist",
+    }
+    # Keep source order: _split_blocklist must be defined before it is called.
     selected = [
         node
         for node in tree.body
-        if isinstance(node, (ast.Assign, ast.FunctionDef))
-        and (
-            getattr(node, "name", None) == "is_valid_wikipedia_source"
-            or any(
-                getattr(target, "id", None)
-                in {
-                    "GENERALLY_UNRELIABLE",
-                    "DEPRECATED",
-                    "BLACKLISTED",
-                    "_COMBINED_UNRELIABLE_SOURCES",
-                }
-                for target in getattr(node, "targets", [])
-            )
-        )
+        if (isinstance(node, ast.Assign) and _assigned_names(node) & wanted_assignments)
+        or (isinstance(node, ast.FunctionDef) and node.name in wanted_functions)
     ]
     urlparse = __import__("urllib.parse", fromlist=["urlparse"]).urlparse
     namespace = {"urlparse": urlparse}
     exec(
         compile(ast.Module(body=selected, type_ignores=[]), "<test>", "exec"), namespace
     )
-    is_valid = namespace["is_valid_wikipedia_source"]
+    return namespace["is_valid_wikipedia_source"]
+
+
+def test_wikipedia_source_filter_matches_on_host_boundaries():
+    is_valid = load_wikipedia_source_filter()
+
+    # Allowed
     assert is_valid("https://example.com/article")
+    assert is_valid("https://notamazon.com/dp/x")
+    assert is_valid("https://sports.yahoo.com/news")
+    assert is_valid("https://artsy.net/artwork")
+    assert is_valid("https://thehistoryblog.com/post")
+    assert is_valid("not a url")
+
+    # Blocked by exact hostname or subdomain (entries that contain a dot)
+    assert not is_valid("https://www.bestgore.com/x")
+    assert not is_valid("https://examiner.com/article")
+
+    # Blocked by a hostname label (entries without a dot)
     assert not is_valid("https://arxiv.org/abs/2402.14207")
     assert not is_valid("https://www.amazon.com/dp/x")
+    assert not is_valid("https://amazon.co.uk/dp/x")
+    assert not is_valid("https://medium.com/@author")
+    assert not is_valid("https://www.history.com/shows")
+    assert not is_valid("https://en.wikipedia.org/wiki/Storm")
+
+    # Ports and userinfo do not hide the hostname
+    assert not is_valid("http://www.amazon.com:8080/dp/x")
+    assert not is_valid("http://user@amazon.com/dp/x")
+
     print("is_valid_wikipedia_source OK")
 
 
@@ -205,5 +242,5 @@ if __name__ == "__main__":
     test_encoder_raises_on_short_response()
     test_information_hash_matches_equality()
     test_update_citation_index_single_pass()
-    test_wikipedia_source_filter_is_case_insensitive()
+    test_wikipedia_source_filter_matches_on_host_boundaries()
     print("ALL TESTS PASSED")

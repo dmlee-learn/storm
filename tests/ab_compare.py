@@ -25,6 +25,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import types
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -253,8 +254,8 @@ def cosine_similarity(x, y):
 class StubEncoder:
     """Models a sentence transformer: raw vectors, optional L2 normalization."""
 
-    def __init__(self, dim=32):
-        self.dim = dim
+    def __init__(self, *args, **kwargs):
+        self.dim = 32
 
     def _vec(self, text):
         digest = hashlib.md5(text.encode("utf-8")).digest()
@@ -270,19 +271,68 @@ class StubEncoder:
         return vectors[0] if single else vectors
 
 
-def build_table(cls, snippets, urls, normalize_snippets):
+def load_retrieval_implementation(ref):
+    """Load StormInformationTable with its own prepare_table_for_retrieval.
+
+    The search path changed shape between versions: older code stored raw
+    embeddings and scored with cosine_similarity, newer code stores normalized
+    embeddings and scores with a dot product. Running each version's own
+    prepare step keeps the comparison independent of which ref is which.
+    """
+    source = source_at(ref, STORM_DATACLASS)
+    namespace = {
+        "np": np,
+        "copy": copy,
+        "cosine_similarity": cosine_similarity,
+        "Information": Info,
+        "List": List,
+        "Union": Union,
+        "Optional": Optional,
+        "Dict": Dict,
+        "re": re,
+        "threading": threading,
+        "SentenceTransformer": StubEncoder,
+    }
+    class_name = "StormInformationTable"
+    method_names = {"prepare_table_for_retrieval", "retrieve_information"}
+    module_names = {
+        "_SENTENCE_TRANSFORMER",
+        "_SENTENCE_TRANSFORMER_LOCK",
+        "_get_sentence_transformer",
+    }
+
+    for node in ast.parse(source).body:
+        selected = None
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            node.bases = [ast.parse("object").body[0].value]
+            node.keywords = []
+            node.body = [
+                item
+                for item in node.body
+                if isinstance(item, ast.FunctionDef) and item.name in method_names
+            ]
+            selected = node
+        elif isinstance(node, ast.Assign) and _assigned_names(node) & module_names:
+            selected = node
+        elif isinstance(node, ast.FunctionDef) and node.name in module_names:
+            selected = node
+        if selected is not None:
+            exec(
+                compile(ast.Module(body=[selected], type_ignores=[]), "<ab>", "exec"),
+                namespace,
+            )
+
+    return namespace[class_name]
+
+
+def build_table(cls, snippets, urls):
+    """Populate url_to_info, then let the implementation prepare embeddings."""
     table = cls.__new__(cls)
-    table.encoder = StubEncoder()
-    table.collected_urls = list(urls)
-    table.collected_snippets = list(snippets)
     table.url_to_info = {}
     for url, snippet in zip(urls, snippets):
         table.url_to_info.setdefault(url, Info(url, []))
         table.url_to_info[url].snippets.append(snippet)
-    unique = list(dict.fromkeys(snippets))
-    encoded = table.encoder.encode(unique, normalize_embeddings=normalize_snippets)
-    by_text = dict(zip(unique, encoded))
-    table.encoded_snippets = np.array([by_text[snippet] for snippet in snippets])
+    table.prepare_table_for_retrieval()
     return table
 
 
@@ -294,38 +344,16 @@ def selection(table, query, k):
 
 
 def check_retrieval(old_ref, new_ref):
-    namespace = {
-        "np": np,
-        "copy": copy,
-        "cosine_similarity": cosine_similarity,
-        "Information": Info,
-        "List": List,
-        "Union": Union,
-        "Optional": Optional,
-        "Dict": Dict,
-        "re": re,
-    }
-    old_cls = load_class_methods(
-        source_at(old_ref, STORM_DATACLASS),
-        "StormInformationTable",
-        {"retrieve_information"},
-        namespace,
-    )
-    new_cls = load_class_methods(
-        source_at(new_ref, STORM_DATACLASS),
-        "StormInformationTable",
-        {"retrieve_information"},
-        namespace,
-    )
+    old_cls = load_retrieval_implementation(old_ref)
+    new_cls = load_retrieval_implementation(new_ref)
 
     rng = random.Random(2)
     snippets = [f"snippet {i} topic {rng.randint(0, 50)}" for i in range(300)]
     urls = [f"http://site{i % 40}.com/page" for i in range(300)]
     queries = [f"query about topic {i}" for i in range(5)]
 
-    # Each version gets the embeddings its own prepare_table_for_retrieval produces.
-    old_table = build_table(old_cls, snippets, urls, normalize_snippets=False)
-    new_table = build_table(new_cls, snippets, urls, normalize_snippets=True)
+    old_table = build_table(old_cls, snippets, urls)
+    new_table = build_table(new_cls, snippets, urls)
 
     total = 0
     mismatched = 0
@@ -338,8 +366,8 @@ def check_retrieval(old_ref, new_ref):
     # Exact ties: identical snippets on every URL make all scores equal.
     tie_snippets = [f"same text {i}" for i in range(50)]
     tie_urls = [f"http://tie{i}.com" for i in range(50)]
-    old_tie = build_table(old_cls, tie_snippets, tie_urls, normalize_snippets=False)
-    new_tie = build_table(new_cls, tie_snippets, tie_urls, normalize_snippets=True)
+    old_tie = build_table(old_cls, tie_snippets, tie_urls)
+    new_tie = build_table(new_cls, tie_snippets, tie_urls)
     old_tie.encoded_snippets = np.tile(old_tie.encoded_snippets[0], (50, 1))
     new_tie.encoded_snippets = old_tie.encoded_snippets.copy()
     old_pick = tuple(info.url for info in old_tie.retrieve_information("q", 5))
@@ -538,9 +566,26 @@ def check_section_insert(old_ref, new_ref):
 
 
 # --------------------------------------------------------- E10 domain blacklist
+def _assigned_names(node):
+    names = set()
+    for target in getattr(node, "targets", []):
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names.update(item.id for item in target.elts if isinstance(item, ast.Name))
+    return names
+
+
 def check_domain_filter(old_ref, new_ref):
-    names = {"GENERALLY_UNRELIABLE", "DEPRECATED", "BLACKLISTED"}
-    select_names = names | {"_COMBINED_UNRELIABLE_SOURCES"}
+    select_names = {
+        "GENERALLY_UNRELIABLE",
+        "DEPRECATED",
+        "BLACKLISTED",
+        "_COMBINED_UNRELIABLE_SOURCES",
+        "_BLOCKED_HOSTS",
+        "_BLOCKED_LABELS",
+    }
+    select_functions = {"is_valid_wikipedia_source", "_split_blocklist"}
     results = []
     for label, ref in (("old", old_ref), ("new", new_ref)):
         source = source_at(ref, RETRIEVER)
@@ -548,11 +593,10 @@ def check_domain_filter(old_ref, new_ref):
         namespace = {"urlparse": urlparse}
         for node in tree.body:
             is_func = (
-                isinstance(node, ast.FunctionDef)
-                and node.name == "is_valid_wikipedia_source"
+                isinstance(node, ast.FunctionDef) and node.name in select_functions
             )
-            is_set = isinstance(node, ast.Assign) and any(
-                getattr(target, "id", None) in select_names for target in node.targets
+            is_set = isinstance(node, ast.Assign) and bool(
+                _assigned_names(node) & select_names
             )
             if is_func or is_set:
                 exec(
@@ -564,17 +608,25 @@ def check_domain_filter(old_ref, new_ref):
     probes = [
         "https://example.com/article",
         "https://www.amazon.com/dp/x",
+        "https://amazon.co.uk/dp/x",
+        "https://notamazon.com/dp/x",
         "https://arxiv.org/abs/2402.14207",
         "https://www.bestgore.com/x",
         "https://en.wikipedia.org/wiki/Storm",
+        "https://sports.yahoo.com/news",
+        "https://artsy.net/artwork",
+        "https://thehistoryblog.com/post",
     ]
-    old_valid = [probes[i] for i, url in enumerate(probes) if results[0](url)]
-    new_valid = [probes[i] for i, url in enumerate(probes) if results[1](url)]
+    old_valid = [url for url in probes if results[0](url)]
+    new_valid = [url for url in probes if results[1](url)]
     return Result(
         "E10 domain blacklist (currently unused code)",
         old_valid == new_valid,
         expected_same=False,
-        detail=f"still allowed: old={len(old_valid)}/5, new={len(new_valid)}/5",
+        detail=(
+            f"allowed old={len(old_valid)}/{len(probes)}, "
+            f"new={len(new_valid)}/{len(probes)}"
+        ),
     )
 
 

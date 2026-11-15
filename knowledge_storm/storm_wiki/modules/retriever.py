@@ -222,17 +222,46 @@ BLACKLISTED = {
 }
 
 
-_COMBINED_UNRELIABLE_SOURCES = frozenset(
-    domain.lower() for domain in GENERALLY_UNRELIABLE | DEPRECATED | BLACKLISTED
-)
+def _split_blocklist():
+    """Split the source list into hostnames and single hostname labels.
+
+    The lists above are transcribed from Wikipedia's perennial sources page, so
+    many entries are article titles ("Ad_Fontes_Media") rather than hostnames.
+    Entries with an underscore can never appear in a hostname, so they are
+    dropped instead of being matched as substrings.
+    """
+    hosts = set()
+    labels = set()
+    for entry in GENERALLY_UNRELIABLE | DEPRECATED | BLACKLISTED:
+        entry = entry.strip().lower()
+        if not entry or "_" in entry:
+            continue
+        if "." in entry:
+            hosts.add(entry)
+        else:
+            labels.add(entry)
+    return frozenset(hosts), frozenset(labels)
+
+
+_BLOCKED_HOSTS, _BLOCKED_LABELS = _split_blocklist()
 
 
 def is_valid_wikipedia_source(url):
-    parsed_url = urlparse(url)
-    # Hostnames are case-insensitive, so compare in lowercase.
-    netloc = parsed_url.netloc.lower()
-    for domain in _COMBINED_UNRELIABLE_SOURCES:
-        if domain in netloc:
+    """Return False when `url` points at a source listed as unreliable.
+
+    Matching happens on hostname boundaries instead of raw substrings. A URL is
+    rejected when its host equals or is a subdomain of a listed hostname
+    ("amazon.com"), or when one of its hostname labels equals a listed name
+    ("amazon" in "www.amazon.co.uk"). This keeps "notamazon.com",
+    "sports.yahoo.com" and "thehistoryblog.com" from being rejected.
+    """
+    host = urlparse(url).hostname
+    if not host:
+        return True
+    host = host.lower()
+
+    for domain in _BLOCKED_HOSTS:
+        if host == domain or host.endswith("." + domain):
             return False
 
-    return True
+    return not any(label in _BLOCKED_LABELS for label in host.split("."))
